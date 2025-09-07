@@ -1,13 +1,13 @@
-# Natter (RouterOS优化版)
+# Natter (RouterOS不能配置Upnp过期的AI优化版)
 
 ## 项目概述
 
-本版本是对[原始Natter项目](https://github.com/MikeWang000000/Natter)的RouterOS功能增强优化版本，特别针对RouterOS设备进行了多项改进。
+本版本是对[原始Natter项目](https://github.com/MikeWang000000/Natter)的修改版本，解决RouterOS不能配置Upnp自动过期的问题
 
 ## 主要优化内容
 
 ### RouterOS功能优化
-- 针对[natter#92](https://github.com/MikeWang000000/Natter/issues/92)问题，RouterOS不支持设置upnp自动过期时间，支持了Router NAT模式
+- 针对[natter#92](https://github.com/MikeWang000000/Natter/issues/92)，RouterOS不支持设置upnp自动过期时间的问题
 - 基于RouterOS REST API操作NAT
 - 支持自定义实例ID，局域网内同时运行多个Natter实例时，通过实例ID区分nat
 ### Docker能力优化
@@ -16,7 +16,7 @@
 
 ## 快速使用
 
-### 基本测试
+### 基本使用
 同natter
 
 ### RouterOS模式
@@ -24,7 +24,7 @@
 python3 natter.py -R --ros-ip 192.168.1.1 --ros-user admin --ros-pass your_password
 ```
 
-### 常用RouterOS选项
+### 增加的选项
 ```
 -R                 启用RouterOS NAT模式
 --ros-ip <address> RouterOS设备IP（默认：192.168.88.1）
