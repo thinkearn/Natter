@@ -1129,6 +1129,8 @@ class UPnPDevice(object):
         services_d = {}     # service_id => UPnPService()
         for url in self.xml_urls:
             sd = self._get_srv_dict(url)
+            if sd is None:
+                continue
             services_d.update(sd)
         self.services.extend(services_d.values())
         for srv in self.services:
@@ -1307,6 +1309,452 @@ class UPnPClient(object):
             self._fwd_dest_port, self._fwd_udp, self._fwd_duration
         )
         Logger.debug("upnp: OK")
+
+class RouterOSClient(object):
+    def __init__(self, host, port, username, password, bind_ip=None, interface=None, instance_id=None):
+        self.host = host
+        self.port = port
+        self.username = username
+        self.password = password
+        self._bind_ip = bind_ip
+        self._interface = interface  # 存储用户指定的接口名称
+        self._fwd_port = None
+        self._fwd_dest_port = None
+        self._fwd_dest_host = None
+        self._fwd_udp = False
+        # 如果没有提供instance_id，则设为空字符串
+        self._instance_id = instance_id if instance_id else ""
+        # 使用包含instance_id的注释作为特殊标志位
+        self._fwd_comment = "Natter" + (f"-{self._instance_id}" if self._instance_id else "")
+        self._added_rules = []
+        self._sock_timeout = 30  # 增加超时时间到30秒
+        
+        # 使用REST API的基本URL
+        self._base_url = f"http://{self.host}:{self.port}/rest"
+        Logger.debug(f"routeros: REST API base URL: {self._base_url}")
+        
+        # 初始化HTTP opener
+        self._init_opener()
+    
+    def _init_opener(self):
+        """初始化HTTP opener用于REST API调用"""
+        import urllib.request
+        import base64
+        
+        # 创建一个opener
+        self._opener = urllib.request.build_opener(
+            urllib.request.HTTPHandler(),
+            urllib.request.HTTPSHandler()
+        )
+        
+        # 添加基本认证通过header
+        auth_string = f"{self.username}:{self.password}"
+        auth_bytes = auth_string.encode('utf-8')
+        auth_base64 = base64.b64encode(auth_bytes).decode('utf-8')
+        self._opener.addheaders = [
+            ('Authorization', f'Basic {auth_base64}'),
+            ('Content-Type', 'application/json'),
+            ('User-Agent', 'Natter/2.1.1 (RouterOS REST Client)')
+        ]
+        
+        Logger.debug("routeros: HTTP opener initialized with basic authentication via headers")
+
+    def _execute_rest_command(self, method, path, data=None, params=None):
+        """执行REST API命令并返回解析后的JSON响应，包含重试机制"""
+        import urllib.request
+        import urllib.parse
+        import json
+        import time
+        
+        url = f"{self._base_url}{path}"
+        
+        # 添加查询参数
+        if params:
+            url += '?' + urllib.parse.urlencode(params)
+        
+        # 准备请求数据
+        data_bytes = None
+        if data:
+            data_bytes = json.dumps(data).encode('utf-8')
+        
+        # 创建请求
+        req = urllib.request.Request(url, data=data_bytes, method=method)
+        
+        # 设置Content-Type头为application/json
+        req.add_header('Content-Type', 'application/json')
+        # 设置Accept头
+        req.add_header('Accept', 'application/json')
+        
+        Logger.debug(f"routeros: Executing REST {method} request to {url}")
+        if data:
+            Logger.debug(f"routeros: Request data: {data}")
+        
+        # 设置重试次数
+        max_retries = 3
+        retry_count = 0
+        base_delay = 1  # 基础延迟时间（秒）
+        
+        while retry_count <= max_retries:
+            try:
+                # 发送请求并获取响应
+                with self._opener.open(req, timeout=self._sock_timeout) as response:
+                    # 读取响应内容
+                    content = response.read().decode('utf-8')
+                    Logger.debug(f"routeros: Response status: {response.status}, content: {content}")
+                    
+                    # 解析JSON响应
+                    if content:
+                        return json.loads(content)
+                    return {}
+            except urllib.error.HTTPError as e:
+                # 处理HTTP错误
+                error_content = e.read().decode('utf-8') if hasattr(e, 'read') else 'N/A'
+                Logger.error(f"routeros: HTTP Error {e.code}: {e.reason}, content: {error_content}")
+                
+                # 特殊处理401（认证失败）和404（未找到），不重试
+                if e.code in (401, 404):
+                    raise RuntimeError(f"HTTP Error {e.code}: {e.reason}")
+                
+                retry_count += 1
+                if retry_count <= max_retries:
+                    delay = base_delay * (2 ** (retry_count - 1))  # 指数退避策略
+                    Logger.warning(f"routeros: Retrying request ({retry_count}/{max_retries}) after {delay}s...")
+                    time.sleep(delay)
+                else:
+                    raise RuntimeError(f"HTTP Error {e.code}: {e.reason} after {max_retries} retries")
+            except urllib.error.URLError as e:
+                # 处理URL错误（连接问题等）
+                Logger.error(f"routeros: URL Error: {e.reason}")
+                
+                if isinstance(e.reason, ConnectionRefusedError):
+                    Logger.error("routeros: Connection refused. Make sure RouterOS REST API is enabled and port is correct.")
+                    Logger.error("routeros: To enable REST API on RouterOS: /ip service set api-ssl disabled=no")
+                elif isinstance(e.reason, TimeoutError):
+                    Logger.error("routeros: Connection timed out. Check if RouterOS device is reachable and REST API is running.")
+                elif hasattr(e.reason, 'errno'):
+                    Logger.error(f"routeros: Network error with errno {e.reason.errno}: {e.reason.strerror}")
+                
+                retry_count += 1
+                if retry_count <= max_retries:
+                    delay = base_delay * (2 ** (retry_count - 1))  # 指数退避策略
+                    Logger.warning(f"routeros: Retrying request ({retry_count}/{max_retries}) after {delay}s...")
+                    time.sleep(delay)
+                    # 重置opener，避免使用可能已经损坏的连接
+                    self._init_opener()
+                else:
+                    raise RuntimeError(f"URL Error: {e.reason} after {max_retries} retries")
+            except ConnectionResetError as ex:
+                # 专门处理ConnectionResetError异常
+                Logger.error(f"routeros: Connection reset by peer: {ex}")
+                Logger.debug("routeros: This is often caused by network instability or RouterOS API timeout")
+                
+                retry_count += 1
+                if retry_count <= max_retries:
+                    delay = base_delay * (2 ** (retry_count - 1))  # 指数退避策略
+                    Logger.warning(f"routeros: Retrying request ({retry_count}/{max_retries}) after {delay}s...")
+                    time.sleep(delay)
+                    # 重置opener，避免使用可能已经损坏的连接
+                    self._init_opener()
+                else:
+                    raise RuntimeError(f"Connection reset by peer after {max_retries} retries")
+            except Exception as ex:
+                # 处理其他错误
+                Logger.error(f"routeros: Request failed: {ex}")
+                import traceback
+                Logger.debug(f"routeros: Exception details: {traceback.format_exc()}")
+                
+                retry_count += 1
+                if retry_count <= max_retries:
+                    delay = base_delay * (2 ** (retry_count - 1))  # 指数退避策略
+                    Logger.warning(f"routeros: Retrying request ({retry_count}/{max_retries}) after {delay}s...")
+                    time.sleep(delay)
+                else:
+                    raise
+
+    def _get_interface_name(self):
+        """通过REST API获取默认网关接口名称"""
+        try:
+            # 首先列出所有可用接口，使用info级别确保显示
+            Logger.info("routeros: Listing all available interfaces for debugging")
+            all_interfaces = self._execute_rest_command('GET', '/interface')
+            if all_interfaces and isinstance(all_interfaces, list):
+                Logger.info(f"routeros: Available interfaces: {[iface.get('name', '') for iface in all_interfaces]}")
+            else:
+                Logger.warning("routeros: Failed to get interfaces list")
+            
+            # 尝试多种方法获取外部接口
+            # 方法1: 获取默认路由
+            Logger.info("routeros: Trying to get interface name via default route")
+            try:
+                response = self._execute_rest_command('GET', '/ip/route', params={'dst-address': '0.0.0.0/0'})
+                
+                if response and isinstance(response, list) and len(response) > 0:
+                    # 打印完整响应用于调试
+                    Logger.info(f"routeros: Default route response: {response}")
+                    # 取第一条默认路由的接口
+                    interface = response[0].get('interface', 'ether1')
+                    Logger.info(f"routeros: Got interface name '{interface}' from default route")
+                    return interface
+            except Exception as e:
+                Logger.warning(f"routeros: Failed to get default route: {e}")
+            
+            # 方法2: 获取所有活动的接口
+            Logger.info("routeros: Trying to get active interfaces")
+            try:
+                interfaces = self._execute_rest_command('GET', '/interface', params={'running': 'true'})
+                if interfaces and isinstance(interfaces, list) and len(interfaces) > 0:
+                    # 打印所有活动接口
+                    Logger.info(f"routeros: Active interfaces: {[iface.get('name', '') for iface in interfaces]}")
+                    # 优先返回WAN或pppoe接口
+                    for iface in interfaces:
+                        if_name = iface.get('name', '')
+                        if_type = iface.get('type', '')
+                        Logger.info(f"routeros: Found active interface: {if_name} (type: {if_type})")
+                        if 'pppoe' in if_name.lower() or 'wan' in if_name.lower():
+                            Logger.info(f"routeros: Selecting interface '{if_name}' as external interface")
+                            return if_name
+                    # 如果没有特殊接口，返回第一个活动接口
+                    first_iface = interfaces[0].get('name', 'ether1')
+                    Logger.info(f"routeros: Using first active interface '{first_iface}'")
+                    return first_iface
+            except Exception as e:
+                Logger.warning(f"routeros: Failed to get active interfaces: {e}")
+            
+            # 如果API调用失败，返回一个可能的接口名称列表供测试
+            possible_interfaces = ['ether1', 'ether2', 'wan1', 'pppoe-out1', 'bridge']
+            Logger.warning(f"routeros: Could not find active interfaces via API, trying common interface names: {possible_interfaces}")
+            return possible_interfaces[0]  # 返回第一个常见接口名称
+        except Exception as ex:
+            Logger.error(f"routeros: Failed to get interface name: {ex}")
+            import traceback
+            Logger.info(f"routeros: Exception details: {traceback.format_exc()}")
+        
+        return "ether1"  # 默认接口
+
+    def delete_all_natter_rules(self):
+        """通过REST API删除所有Natter添加的NAT规则"""
+        try:
+            # 先列出所有带Natter注释的NAT规则
+            Logger.debug(f"routeros: Searching for NAT rules with comment '{self._fwd_comment}'")
+            response = self._execute_rest_command('GET', '/ip/firewall/nat', params={'comment': self._fwd_comment})
+            
+            # 收集规则ID并删除
+            rule_ids = []
+            if response and isinstance(response, list):
+                Logger.debug(f"routeros: Found {len(response)} rules to delete")
+                for rule in response:
+                    if '.id' in rule:
+                        rule_id = rule['.id']
+                        rule_ids.append(rule_id)
+                        # 删除规则
+                        Logger.debug(f"routeros: Deleting rule with ID: {rule_id}")
+                        try:
+                            self._execute_rest_command('DELETE', f'/ip/firewall/nat/{rule_id}')
+                            Logger.debug(f"routeros: Successfully deleted rule with ID: {rule_id}")
+                        except Exception as e:
+                            Logger.error(f"routeros: Failed to delete rule {rule_id}: {e}")
+            else:
+                Logger.debug("routeros: No Natter rules found to delete")
+            
+            self._added_rules = []
+            Logger.info(f"routeros: Successfully deleted {len(rule_ids)} Natter rules")
+            return len(rule_ids)
+        except Exception as ex:
+            Logger.error(f"routeros: Failed to delete Natter rules: {ex}")
+            import traceback
+            Logger.debug(f"routeros: Exception details: {traceback.format_exc()}")
+            return 0
+
+    def forward(self, host, port, dest_host, dest_port, udp=False, duration=0):
+        """通过RouterOS REST API添加端口转发规则"""
+        try:
+            # 首先删除任何现有的Natter规则以避免冲突
+            Logger.debug("routeros: Checking for existing Natter rules")
+            deleted = self.delete_all_natter_rules()
+            if deleted > 0:
+                Logger.info(f"routeros: Deleted {deleted} existing Natter rules")
+            
+            # 使用用户指定的接口名称，如果没有提供则自动获取
+            interface = self._interface
+            if not interface:
+                Logger.debug("routeros: No interface specified, retrieving external interface name")
+                interface = self._get_interface_name()
+            Logger.info(f"routeros: Using interface '{interface}'")
+            
+            # 添加新的NAT规则
+            protocol = "udp" if udp else "tcp"
+            Logger.debug(f"routeros: Adding NAT rule for {protocol} port {port} -> {dest_host}:{dest_port}")
+            
+            # 准备规则数据
+            # 注意：RouterOS REST API的参数名可能需要使用连字符而不是下划线
+            rule_data = {
+                'chain': 'dstnat',
+                'protocol': protocol,
+                'dst-address': '0.0.0.0/0',  # 任何目标地址
+                'dst-port': str(dest_port),
+                'in-interface': interface,
+                'action': 'dst-nat',
+                'to-addresses': dest_host,
+                'to-ports': str(dest_port),
+                'comment': self._fwd_comment
+            }
+            
+            Logger.debug(f"routeros: Rule data: {rule_data}")
+            
+            # 使用指定的接口名称，不再遍历多个接口
+            test_interface = interface
+            # 尝试使用不同的REST API端点格式和数据格式
+            Logger.info(f"routeros: Testing with interface '{test_interface}'")
+            # 更新规则数据中的接口名称
+            test_rule_data = rule_data.copy()
+            test_rule_data['in-interface'] = test_interface
+            
+            try:
+                # 尝试格式1: PUT /ip/firewall/nat
+                Logger.info(f"routeros: Trying to create NAT rule with format 1: PUT /ip/firewall/nat (interface: {test_interface})")
+                response = self._execute_rest_command('PUT', '/ip/firewall/nat', data=test_rule_data)
+                Logger.info(f"routeros: NAT rule creation response: {response}")
+                
+                if response and isinstance(response, dict) and '.id' in response:
+                    rule_id = response['.id']
+                    self._added_rules.append(rule_id)
+                    self._fwd_port = port
+                    self._fwd_dest_port = dest_port
+                    self._fwd_dest_host = dest_host
+                    self._fwd_udp = udp
+                    Logger.info(f"routeros: Added NAT rule for {protocol.upper()} port {port} -> {dest_host}:{dest_port} using interface '{test_interface}'")
+                    return True
+            except Exception as e:
+                Logger.warning(f"routeros: First method failed with interface '{test_interface}': {e}")
+                
+                # 尝试格式2: POST /ip/firewall/nat
+                try:
+                    Logger.info(f"routeros: Trying to create NAT rule with format 2: POST /ip/firewall/nat (interface: {test_interface})")
+                    response = self._execute_rest_command('POST', '/ip/firewall/nat', data=test_rule_data)
+                    Logger.info(f"routeros: NAT rule creation response: {response}")
+                    
+                    if response and '.id' in response:
+                        rule_id = response['.id']
+                        self._added_rules.append(rule_id)
+                        self._fwd_port = port
+                        self._fwd_dest_port = dest_port
+                        self._fwd_dest_host = dest_host
+                        self._fwd_udp = udp
+                        Logger.info(f"routeros: Added NAT rule for {protocol.upper()} port {port} -> {dest_host}:{dest_port} using interface '{test_interface}'")
+                        return True
+                except Exception as e2:
+                    Logger.warning(f"routeros: Second method failed with interface '{test_interface}': {e2}")
+                    
+                    # 尝试使用简化的规则格式（可能更兼容）
+                    try:
+                        Logger.info(f"routeros: Trying simplified NAT rule format (interface: {test_interface})")
+                        simplified_rule = {
+                            'chain': 'dstnat',
+                            'protocol': protocol,
+                            'dst-port': str(port),
+                            'in-interface': test_interface,
+                            'action': 'dst-nat',
+                            'to-addresses': dest_host,
+                            'to-ports': str(dest_port)
+                        }
+                        response = self._execute_rest_command('POST', '/ip/firewall/nat', data=simplified_rule)
+                        Logger.info(f"routeros: Simplified rule response: {response}")
+                        
+                        if response and '.id' in response:
+                            rule_id = response['.id']
+                            self._added_rules.append(rule_id)
+                            # 添加注释到已创建的规则
+                            self._execute_rest_command('PATCH', f'/ip/firewall/nat/{rule_id}', data={'comment': self._fwd_comment})
+                            self._fwd_port = port
+                            self._fwd_dest_port = dest_port
+                            self._fwd_dest_host = dest_host
+                            self._fwd_udp = udp
+                            Logger.info(f"routeros: Added simplified NAT rule for {protocol.upper()} port {port} -> {dest_host}:{dest_port} using interface '{test_interface}'")
+                            return True
+                    except Exception as e3:
+                        Logger.warning(f"routeros: Simplified method failed with interface '{test_interface}': {e3}")
+            
+            # 如果两种格式都失败，检查是否已经存在相同的规则
+            Logger.debug("routeros: Checking if rule already exists")
+            existing_rules = self._execute_rest_command('GET', '/ip/firewall/nat', {
+                'chain': 'dstnat',
+                'protocol': protocol,
+                'dst-port': str(port),
+                'in-interface': interface,
+                'action': 'dst-nat',
+                'to-addresses': dest_host,
+                'to-ports': str(dest_port)
+            })
+            
+            if existing_rules and isinstance(existing_rules, list) and len(existing_rules) > 0:
+                rule_id = existing_rules[0]['.id']
+                self._added_rules.append(rule_id)
+                self._fwd_port = port
+                self._fwd_dest_port = dest_port
+                self._fwd_dest_host = dest_host
+                self._fwd_udp = udp
+                Logger.info(f"routeros: Found existing matching NAT rule with ID: {rule_id}")
+                return True
+            
+            Logger.error("routeros: Failed to add NAT rule - no rule ID returned by either method")
+            return False
+        except Exception as ex:
+            Logger.error(f"routeros: Forwarding failed: {ex}")
+            # 打印更详细的异常信息
+            import traceback
+            Logger.debug(f"routeros: Exception details: {traceback.format_exc()}")
+            return False
+
+    def renew(self):
+        """更新当前的NAT规则
+        1. 如果当前instance_id在ros能查到NAT记录且端口一直则直接退出并视为renew成功
+        2. 如果不一致，则删掉所有instance_id对应的nat记录，然后添加一条新的正确的
+        """
+        if self._fwd_port is None:
+            raise RuntimeError("RouterOS forward not started")
+        
+        Logger.debug("routeros: Renewing NAT rule")
+        
+        # 获取当前配置的接口名称
+        interface = self._interface
+        if not interface:
+            Logger.debug("routeros: No interface specified, retrieving external interface name")
+            interface = self._get_interface_name()
+        
+        # 检查现有的NAT规则
+        Logger.debug(f"routeros: Checking existing NAT rules for comment '{self._fwd_comment}'")
+        protocol = "udp" if self._fwd_udp else "tcp"
+        
+        # 搜索匹配条件的NAT规则
+        existing_rules = self._execute_rest_command('GET', '/ip/firewall/nat', {
+            'comment': self._fwd_comment,
+            'chain': 'dstnat',
+            'protocol': protocol,
+            'dst-port': str(self._fwd_port),
+            'in-interface': interface,
+            'action': 'dst-nat',
+            'to-addresses': self._fwd_dest_host,
+            'to-ports': str(self._fwd_dest_port)
+        })
+        
+        # 如果找到了完全匹配的规则，则认为renew成功
+        if existing_rules and isinstance(existing_rules, list) and len(existing_rules) > 0:
+            rule_id = existing_rules[0]['.id']
+            Logger.info(f"routeros: Found existing matching NAT rule with ID: {rule_id}, renew successful without changes")
+            return True
+        
+        # 如果没有找到匹配的规则，删除所有instance_id对应的规则，然后添加新规则
+        Logger.debug("routeros: No matching NAT rule found, deleting existing rules and adding new one")
+        return self.forward(
+            "", self._fwd_port, self._fwd_dest_host, 
+            self._fwd_dest_port, self._fwd_udp, 0
+        )
+
+    def close(self):
+        """清理资源"""
+        # REST API使用HTTP连接，不需要显式关闭连接
+        Logger.debug("routeros: Connection closed")
+        pass
 
 
 class NatterExitException(Exception):
@@ -1522,6 +1970,34 @@ def natter_main(show_title = True):
         "-e", type=str, metavar="<path>", default=None,
         help="script path for notifying mapped address"
     )
+    # RouterOS options
+    group.add_argument(
+        "-R", action="store_true", help="enable RouterOS NAT mode"
+    )
+    group.add_argument(
+        "--ros-ip", type=str, metavar="<address>", default="192.168.88.1",
+        help="IP address of RouterOS device (default: 192.168.88.1)"
+    )
+    group.add_argument(
+        "--ros-user", type=str, metavar="<username>", default="admin",
+        help="username for RouterOS login (default: admin)"
+    )
+    group.add_argument(
+        "--ros-pass", type=str, metavar="<password>", default="",
+        help="password for RouterOS login (default: empty)"
+    )
+    group.add_argument(
+        "--ros-port", type=int, metavar="<port>", default=80,
+        help="API port of RouterOS device (default: 80)"
+    )
+    group.add_argument(
+        "--ros-interface", type=str, metavar="<interface>", default=None,
+        help="RouterOS interface name for NAT rules (e.g. 'pppoe-out1')"
+    )
+    group.add_argument(
+        "--ros-instance-id", type=str, metavar="<id>", default=None,
+        help="unique instance ID for NAT rules (default: auto-generated UUID)"
+    )
     group = argp.add_argument_group("bind options")
     group.add_argument(
         "-i", type=str, metavar="<interface>", default="0.0.0.0",
@@ -1548,6 +2024,9 @@ def natter_main(show_title = True):
     group.add_argument(
         "-r", action="store_true", help="keep retrying until the port of forward target is open"
     )
+    group.add_argument(
+        "--no-docker-check", action="store_true", help="disable Docker network check"
+    )
 
     args = argp.parse_args()
     verbose = args.v
@@ -1565,6 +2044,15 @@ def natter_main(show_title = True):
     to_port = args.p
     keep_retry = args.r
     exit_when_changed = args.q
+    # RouterOS options
+    ros_enabled = args.R
+    ros_ip = args.ros_ip
+    ros_user = args.ros_user
+    ros_pass = args.ros_pass
+    ros_port = args.ros_port
+    ros_interface = args.ros_interface
+    ros_instance_id = args.ros_instance_id
+    no_docker_check = args.no_docker_check
 
     sys.tracebacklimit = 0
     if verbose:
@@ -1681,7 +2169,9 @@ def natter_main(show_title = True):
         if len(sys.argv) == 1:
             Logger.info("Tips: Use `--help` to see help messages")
 
-    check_docker_network()
+    # Check Docker network unless explicitly disabled
+    if not no_docker_check:
+        check_docker_network()
 
     forwarder = ForwardImpl()
     port_test = PortTest()
@@ -1734,11 +2224,48 @@ def natter_main(show_title = True):
     if upnp_router:
         Logger.info("[UPnP] Found router %s" % upnp_router.ipaddr)
         try:
-            upnp.forward("", bind_port, bind_ip, bind_port, udp=udp_mode, duration=interval*3)
+            upnp.forward("", bind_port, bind_ip, bind_port, udp=udp_mode, duration=0)
         except (OSError, socket.error, ValueError) as ex:
             Logger.error("upnp: failed to forward port: %s" % ex)
         else:
             upnp_ready = True
+    
+    # RouterOS
+    ros_client = None
+    ros_ready = False
+    
+    if ros_enabled:
+        ros_client = RouterOSClient(
+            host=ros_ip,
+            port=ros_port,
+            username=ros_user,
+            password=ros_pass,
+            bind_ip=natter_addr[0],
+            interface=ros_interface if ros_interface else bind_interface,
+            instance_id=ros_instance_id
+        )
+        Logger.info()
+        Logger.info("Connecting to RouterOS...")
+        try:
+            # First, delete any existing Natter rules to avoid conflicts
+            ros_client.delete_all_natter_rules()
+            # Add new forwarding rule
+            if ros_client.forward("", outer_addr[1], bind_ip, bind_port, udp=udp_mode, duration=0):
+                ros_ready = True
+                # Register cleanup function
+                def cleanup_ros():
+                    try:
+                        if ros_client:
+                            deleted = ros_client.delete_all_natter_rules()
+                            if deleted > 0:
+                                Logger.info("routeros: Cleaned up %d NAT rules on exit" % deleted)
+                            ros_client.close()
+                    except Exception as ex:
+                        Logger.error("routeros: Cleanup failed: %s" % ex)
+                
+                NatterExit.set_atexit(cleanup_ros)
+        except Exception as ex:
+            Logger.error("routeros: Error setting up NAT: %s" % ex)
 
     # Display route information
     Logger.info()
@@ -1826,6 +2353,8 @@ def natter_main(show_title = True):
                 upnp.renew()
             except (OSError, socket.error) as ex:
                 Logger.error("upnp: failed to renew upnp: %s" % ex)
+
+        # Renew RouterOS NAT rule
         sleep_sec = interval - (time.time() - ts)
         if sleep_sec > 0:
             time.sleep(sleep_sec)

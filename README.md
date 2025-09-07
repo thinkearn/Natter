@@ -1,110 +1,40 @@
-# Natter (v2)
+# Natter (RouterOS优化版)
 
-Expose your port behind full-cone NAT to the Internet.
-  
-[中文文档](docs/README.md)
+## 项目概述
 
+本版本是对[原始Natter项目](https://github.com/MikeWang000000/Natter)的RouterOS功能增强优化版本，特别针对RouterOS设备进行了多项改进。
 
-## Quick start
+## 主要优化内容
 
+### RouterOS功能优化
+- 针对[natter#92](https://github.com/MikeWang000000/Natter/issues/92)问题，RouterOS不支持设置upnp自动过期时间，支持了Router NAT模式
+- 基于RouterOS REST API操作NAT
+- 支持自定义实例ID，局域网内同时运行多个Natter实例时，通过实例ID区分nat
+### Docker能力优化
+- 支持`--no-docker-check`参数关闭host模式检查
+- 关闭host模式检查后，natter和业务容器可以通过network_mode: "service:xxx"的方式共享网络空间以实现转发且尽可能不影响宿主机网络
+
+## 快速使用
+
+### 基本测试
+同natter
+
+### RouterOS模式
 ```bash
-python3 natter.py
+python3 natter.py -R --ros-ip 192.168.1.1 --ros-user admin --ros-pass your_password
 ```
 
-Or, using Docker:
-
-```bash
-docker run --net=host nattertool/natter
+### 常用RouterOS选项
+```
+-R                 启用RouterOS NAT模式
+--ros-ip <address> RouterOS设备IP（默认：192.168.88.1）
+--ros-user <user>  登录用户名（默认：admin）
+--ros-pass <pass>  登录密码
+--ros-interface <if> 外网接口名称（可选，自动检测）
+--ros-instance-id <id> 实例唯一标识
+--no-docker-check  跳过Docker网络检查
 ```
 
-```
-2023-11-01 01:00:08 [I] Natter
-2023-11-01 01:00:08 [I] Tips: Use `--help` to see help messages
-2023-11-01 01:00:12 [I]
-2023-11-01 01:00:12 [I] tcp://192.168.1.100:13483 <--Natter--> tcp://203.0.113.10:14500
-2023-11-01 01:00:12 [I]
-2023-11-01 01:00:12 [I] Test mode in on.
-2023-11-01 01:00:12 [I] Please check [ http://203.0.113.10:14500 ]
-2023-11-01 01:00:12 [I]
-2023-11-01 01:00:12 [I] LAN > 192.168.1.100:13483   [ OPEN ]
-2023-11-01 01:00:12 [I] LAN > 192.168.1.100:13483   [ OPEN ]
-2023-11-01 01:00:12 [I] LAN > 203.0.113.10:14500    [ OPEN ]
-2023-11-01 01:00:13 [I] WAN > 203.0.113.10:14500    [ OPEN ]
-2023-11-01 01:00:13 [I]
-```
+## 原始项目
+基于[https://github.com/MikeWang000000/Natter](https://github.com/MikeWang000000/Natter)项目改进
 
-In the example above, `203.0.113.10` is your public IP address outside the full-cone NAT. Natter opened TCP port `203.0.113.10:14500` for testing.
-
-Visit `http://203.0.113.10:14500` outside your LAN, you will see the web page:
-
-```
-It works!
-
---------
-Natter
-```
-
-
-## Usage
-
-```
-usage: natter.py [--version] [--help] [-v] [-q] [-u] [-U] [-k <interval>]
-                 [-s <address>] [-h <address>] [-e <path>] [-i <interface>]
-                 [-b <port>] [-m <method>] [-t <address>] [-p <port>] [-r]
-
-Expose your port behind full-cone NAT to the Internet.
-
-options:
-  --version, -V   show the version of Natter and exit
-  --help          show this help message and exit
-  -v              verbose mode, printing debug messages
-  -q              exit when mapped address is changed
-  -u              UDP mode
-  -U              enable UPnP/IGD discovery
-  -k <interval>   seconds between each keep-alive
-  -s <address>    hostname or address to STUN server
-  -h <address>    hostname or address to keep-alive server
-  -e <path>       script path for notifying mapped address
-
-bind options:
-  -i <interface>  network interface name or IP to bind
-  -b <port>       port number to bind
-
-forward options:
-  -m <method>     forward method, common values are 'iptables', 'nftables',
-                  'socat', 'gost' and 'socket'
-  -t <address>    IP address of forward target
-  -p <port>       port number of forward target
-  -r              keep retrying until the port of forward target is open
-```
-
-
-## Usage for Docker
-
-Read [natter-docker](natter-docker) for details.
-
-
-## Use cases
-
-Expose local port 80 to the Internet, using built-in forward method:
-
-```bash
-python3 natter.py -p 80
-```
-
-Expose local port 80 to the Internet, using iptables kernel forward method (requires root permission):
-
-```bash
-sudo python3 natter.py -m iptables -p 80
-```
-
-
-## Dependencies
-
-- Python 2.7 (minimum), >= 3.6 (recommended)
-- No third-party modules are required.
-
-
-## License
-
-GNU General Public License v3.0
